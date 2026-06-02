@@ -10,6 +10,7 @@ from datetime import datetime, timezone, timedelta
 import schedule
 
 import polki_tracker
+import webhook
 
 log = logging.getLogger(__name__)
 MSK = timezone(timedelta(hours=3))
@@ -29,6 +30,9 @@ def main():
         level=logging.INFO,
         format="%(asctime)s  %(levelname)-8s  %(message)s",
     )
+    # Запускаем HTTP-webhook на порту 8080
+    webhook.start(port=8080)
+
     log.info("Планировщик запущен. Запуск трекера каждый день в %s МСК", RUN_TIME_MSK)
 
     # Запускаем сразу при старте (тест + первый сбор данных)
