@@ -2,3 +2,4 @@ requests>=2.32.0
 gspread>=6.1.0
 google-auth>=2.29.0
 python-dotenv>=1.0.1
+schedule>=1.2.0

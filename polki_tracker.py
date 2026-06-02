@@ -12,6 +12,9 @@ import sys
 import time
 from datetime import datetime, timezone, timedelta
 
+import json
+import tempfile
+
 import gspread
 import requests
 from dotenv import load_dotenv
@@ -61,16 +64,27 @@ def send_telegram(text: str) -> None:
 # Google Sheets
 # ---------------------------------------------------------------------------
 def get_gsheet():
-    sa_path = os.getenv("GOOGLE_SA_JSON")
     sheet_id = os.getenv("SHEET_ID")
-    if not sa_path or not sheet_id:
-        raise EnvironmentError("GOOGLE_SA_JSON или SHEET_ID не заданы в .env")
+    if not sheet_id:
+        raise EnvironmentError("SHEET_ID не задан в .env")
 
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive.readonly",
     ]
-    creds = Credentials.from_service_account_file(sa_path, scopes=scopes)
+
+    # Вариант 1 (Docker / relaxdev.ru): содержимое JSON передано как переменная окружения
+    sa_content = os.getenv("GOOGLE_SA_JSON_CONTENT")
+    if sa_content:
+        info = json.loads(sa_content)
+        creds = Credentials.from_service_account_info(info, scopes=scopes)
+    else:
+        # Вариант 2 (локальный запуск): путь к файлу ключа
+        sa_path = os.getenv("GOOGLE_SA_JSON")
+        if not sa_path:
+            raise EnvironmentError("Задайте GOOGLE_SA_JSON_CONTENT или GOOGLE_SA_JSON в .env")
+        creds = Credentials.from_service_account_file(sa_path, scopes=scopes)
+
     gc = gspread.authorize(creds)
     return gc.open_by_key(sheet_id)
 

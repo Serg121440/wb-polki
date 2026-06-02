@@ -125,24 +125,48 @@ python polki_tracker.py
 
 ---
 
-## 6. Cron на relaxdev.ru
+## 6. Деплой на relaxdev.ru (Docker)
 
-```bash
-crontab -e
+relaxdev.ru запускает проекты как Docker-контейнеры. Системный cron не нужен —
+расписание встроено в `scheduler.py`, контейнер работает постоянно.
+
+### 6.1 Подготовка JSON-ключа сервисного аккаунта
+
+Содержимое JSON-файла нужно передать в контейнер. Самый простой способ —
+через переменную окружения `GOOGLE_SA_JSON_CONTENT` (см. ниже).
+
+Добавьте в `polki_tracker.py` поддержку этого варианта (одна строка в `get_gsheet`):
+
+```python
+# В функции get_gsheet(), перед Credentials.from_service_account_file:
+sa_content = os.getenv("GOOGLE_SA_JSON_CONTENT")
+if sa_content:
+    import json, tempfile
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".json", mode="w")
+    tmp.write(sa_content)
+    tmp.close()
+    sa_path = tmp.name
 ```
 
-Добавьте строку (запуск в 02:00 МСК каждый день):
+### 6.2 Переменные окружения в relaxdev.ru
 
-```
-0 2 * * * /home/deploy/wb_polki/venv/bin/python /home/deploy/wb_polki/polki_tracker.py >> /var/log/wb_polki/run.log 2>&1
-```
+В настройках проекта → **Environment Variables** добавьте:
 
-Создайте директорию для логов:
+| Переменная | Значение |
+|---|---|
+| `SHEET_ID` | `1Dz0s7VDTtbC90mXk97-R19bseQYnSPI7d3I3FVgDf0Y` |
+| `GOOGLE_SA_JSON_CONTENT` | Весь JSON-ключ одной строкой (скопируйте содержимое файла) |
+| `TELEGRAM_TOKEN` | Токен вашего бота |
+| `TELEGRAM_CHAT_ID` | ID чата для алертов |
 
-```bash
-sudo mkdir -p /var/log/wb_polki
-sudo chown deploy:deploy /var/log/wb_polki
-```
+### 6.3 Деплой
+
+1. Загрузите репозиторий на GitHub.
+2. relaxdev.ru → **Импорт и деплой** → выберите репозиторий.
+3. Платформа найдёт `Dockerfile` и соберёт образ автоматически.
+4. Контейнер запустится и будет ждать 02:00 МСК для первого прогона.
+
+Логи смотреть: **VM → finboad logs** (аналогично для вашего контейнера) или через Live Terminal.
 
 ---
 
