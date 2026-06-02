@@ -152,15 +152,11 @@ def _get_session() -> requests.Session:
 
 def fetch_recom(session: requests.Session, nm: int, dest: int) -> tuple[list[int], int]:
     """
-    Запрашивает карусель «Рекомендуем» для карточки nm.
+    Запрашивает полку «Смотрите также» для карточки nm.
     Возвращает (список nmID до SHELF_DEPTH, фактическая длина).
     При ошибке возвращает ([], 0).
     """
-    params = {
-        "nm": nm,
-        "dest": dest,
-        "limit": config.SHELF_DEPTH,
-    }
+    params = {**config.WB_RECOM_PARAMS, "query": nm}
 
     for attempt in range(1, config.RETRY_MAX + 1):
         try:
@@ -178,11 +174,10 @@ def fetch_recom(session: requests.Session, nm: int, dest: int) -> tuple[list[int
 
             data = resp.json()
 
-            # Структура ответа WB: {"data": {"products": [{"id": ...}, ...]}}
-            # Если WB изменил схему — логируем ключи для диагностики.
+            # Структура ответа u-recom.wb.ru: {"products": [...], "total": N}
             products = (
-                data.get("data", {}).get("products")
-                or data.get("products")
+                data.get("products")
+                or data.get("data", {}).get("products")
                 or []
             )
             if not products and attempt == 1:

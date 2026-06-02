@@ -12,17 +12,35 @@
 #   2. DevTools → Network → фильтр «recom» или «recommend»
 #   3. Найти XHR-запрос, отдающий блок «Рекомендуем»
 #   4. Обновить WB_RECOM_URL и DEST_MOSCOW ниже.
-WB_RECOM_URL = "https://recom.wb.ru/recom/client/v1/recomVendor"
+# Эндпоинт полки «Смотрите также» (блок рекомендаций на карточке товара).
+# Верифицирован 02.06.2026 через DevTools → Network → фильтр «recom»
+# на странице wildberries.ru/catalog/63623637/detail.aspx
+WB_RECOM_URL = "https://u-recom.wb.ru/recom/ru/common/v8/search"
 
-# dest для Москвы (тип доставки + регион). Значение -1257786 соответствует
-# московскому региону — взято из живых сетевых запросов wildberries.ru.
-# Если WB изменит схему dest, уточните значение в DevTools.
-DEST_MOSCOW = -1257786
+# dest для Москвы. Значение взято из живого запроса браузера 02.06.2026.
+# При изменении — поймать в DevTools → Network → фильтр «recom».
+DEST_MOSCOW = 1259570983
+
+# Фиксированные параметры запроса (из живого запроса браузера)
+WB_RECOM_PARAMS = {
+    "ab_testing": "false",
+    "appType": "1",
+    "curr": "rub",
+    "dest": DEST_MOSCOW,
+    "hide_dtype": "15",
+    "hide_vflags": "4294967296",
+    "lang": "ru",
+    "locale": "ru",
+    "page": "1",
+    "resultset": "catalog",
+    "sort": "popular",
+    "spp": "30",
+}
 
 REGION_LABEL = "Москва"
 
 # Тип полки — константа, чтобы позже легко добавить другие
-SHELF_TYPE = "Рекомендуем"
+SHELF_TYPE = "Смотрите также"
 
 # Глубина выдачи
 SHELF_DEPTH = 100
