@@ -264,17 +264,29 @@ def build_rows(watchlist: list[dict], now: datetime) -> list[list]:
 # ---------------------------------------------------------------------------
 # Точка входа
 # ---------------------------------------------------------------------------
+def set_status(spreadsheet, status: str):
+    """Пишет статус в панель управления."""
+    try:
+        ws = spreadsheet.worksheet("🚀 Управление")
+        ws.update("D5", [[status]], value_input_option="RAW")
+    except Exception as e:
+        log.warning("Не удалось обновить статус: %s", e)
+
+
 def main() -> int:
     now = datetime.now(MSK)
     log.info("=== wb_polki_tracker запуск %s ===", now.isoformat())
 
     try:
         spreadsheet = get_gsheet()
+        set_status(spreadsheet, f"⏳ Запущен {now.strftime('%d.%m %H:%M')}")
+
         watchlist = read_watchlist(spreadsheet)
 
         if not watchlist:
             msg = "Watchlist пуст — вкладка 'Полки_вход' не заполнена или пуста."
             log.error(msg)
+            set_status(spreadsheet, "❌ Watchlist пуст")
             send_telegram(f"⚠️ <b>wb_polki</b>: {msg}")
             return 1
 
@@ -283,17 +295,24 @@ def main() -> int:
         if not rows:
             msg = "Не собрано ни одной строки — проверьте доступность WB API и watchlist."
             log.error(msg)
+            set_status(spreadsheet, "❌ Нет данных от WB")
             send_telegram(f"⚠️ <b>wb_polki</b>: {msg}")
             return 1
 
         log_ws = ensure_log_sheet(spreadsheet)
         append_rows(log_ws, rows)
 
+        done_msg = f"✅ Готово {now.strftime('%d.%m %H:%M')} — {len(rows)} строк"
+        set_status(spreadsheet, done_msg)
         log.info("=== Готово: %d строк записано ===", len(rows))
         return 0
 
     except Exception as exc:
         log.exception("Критическая ошибка")
+        try:
+            set_status(get_gsheet(), f"❌ Ошибка: {type(exc).__name__}")
+        except Exception:
+            pass
         send_telegram(
             f"🚨 <b>wb_polki упал</b>\n"
             f"<code>{type(exc).__name__}: {exc}</code>"
