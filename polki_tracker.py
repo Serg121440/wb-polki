@@ -12,6 +12,7 @@ import sys
 import time
 from datetime import datetime, timezone, timedelta
 
+import base64
 import json
 import tempfile
 
@@ -73,16 +74,21 @@ def get_gsheet():
         "https://www.googleapis.com/auth/drive.readonly",
     ]
 
-    # Вариант 1 (Docker / relaxdev.ru): содержимое JSON передано как переменная окружения
+    # Вариант 1 (Docker / relaxdev.ru): JSON в base64 (надёжнее — без проблем с \n)
+    sa_b64 = os.getenv("GOOGLE_SA_JSON_B64")
     sa_content = os.getenv("GOOGLE_SA_JSON_CONTENT")
-    if sa_content:
+    if sa_b64:
+        info = json.loads(base64.b64decode(sa_b64).decode())
+        creds = Credentials.from_service_account_info(info, scopes=scopes)
+    elif sa_content:
+        # Фолбэк: если вставлен как обычный JSON
         info = json.loads(sa_content)
         creds = Credentials.from_service_account_info(info, scopes=scopes)
     else:
         # Вариант 2 (локальный запуск): путь к файлу ключа
         sa_path = os.getenv("GOOGLE_SA_JSON")
         if not sa_path:
-            raise EnvironmentError("Задайте GOOGLE_SA_JSON_CONTENT или GOOGLE_SA_JSON в .env")
+            raise EnvironmentError("Задайте GOOGLE_SA_JSON_B64, GOOGLE_SA_JSON_CONTENT или GOOGLE_SA_JSON в .env")
         creds = Credentials.from_service_account_file(sa_path, scopes=scopes)
 
     gc = gspread.authorize(creds)
