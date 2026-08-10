@@ -123,22 +123,26 @@ def read_watchlist(spreadsheet) -> list[dict]:
     return result
 
 
-def ensure_log_sheet(spreadsheet):
-    """Создаёт вкладку лога с шапкой, если её нет."""
+def ensure_sheet(spreadsheet, name: str, headers: list[str]):
+    """Создаёт вкладку с шапкой, если её нет."""
     try:
-        ws = spreadsheet.worksheet(config.LOG_SHEET_NAME)
+        ws = spreadsheet.worksheet(name)
     except gspread.WorksheetNotFound:
-        ws = spreadsheet.add_worksheet(config.LOG_SHEET_NAME, rows=10000, cols=len(config.LOG_HEADERS))
-        ws.append_row(config.LOG_HEADERS, value_input_option="RAW")
-        log.info("Создана вкладка '%s'", config.LOG_SHEET_NAME)
+        ws = spreadsheet.add_worksheet(name, rows=10000, cols=len(headers))
+        ws.append_row(headers, value_input_option="RAW")
+        log.info("Создана вкладка '%s'", name)
     return ws
 
 
-def append_rows(ws, rows: list[list]) -> None:
+def ensure_log_sheet(spreadsheet):
+    return ensure_sheet(spreadsheet, config.LOG_SHEET_NAME, config.LOG_HEADERS)
+
+
+def append_rows(ws, rows: list[list], sheet_name: str = "") -> None:
     if not rows:
         return
     ws.append_rows(rows, value_input_option="RAW")
-    log.info("Дописано %d строк в '%s'", len(rows), config.LOG_SHEET_NAME)
+    log.info("Дописано %d строк в '%s'", len(rows), sheet_name or ws.title)
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +197,88 @@ def fetch_recom(session: requests.Session, nm: int, dest: int) -> tuple[list[int
                 time.sleep(config.RETRY_BACKOFF ** attempt)
 
     return [], 0
+
+
+def fetch_prices(session: requests.Session, skus: list[int]) -> dict[int, dict]:
+    """
+    Запрашивает карточки товаров пачками и возвращает цены.
+    {sku: {"name": str, "basic": float, "product": float, "discount_pct": float}}
+    Цена берётся из первого размера (sizes[0].price), т.к. для большинства
+    категорий IRON BROTHERS размер один или цена не отличается по размерам.
+    """
+    result: dict[int, dict] = {}
+    batches = [
+        skus[i : i + config.PRICE_BATCH_SIZE]
+        for i in range(0, len(skus), config.PRICE_BATCH_SIZE)
+    ]
+
+    for batch in batches:
+        params = {**config.WB_CARD_PARAMS, "nm": ";".join(str(s) for s in batch)}
+
+        for attempt in range(1, config.RETRY_MAX + 1):
+            try:
+                resp = session.get(
+                    config.WB_CARD_URL,
+                    params=params,
+                    timeout=config.REQUEST_TIMEOUT,
+                )
+                if resp.status_code == 429:
+                    wait = config.RETRY_BACKOFF ** attempt * 5
+                    log.warning("429 при запросе цен, ждём %.0fs", wait)
+                    time.sleep(wait)
+                    continue
+                resp.raise_for_status()
+
+                data = resp.json()
+                for p in data.get("products", []):
+                    sku = p.get("id")
+                    sizes = p.get("sizes") or []
+                    if not sku or not sizes:
+                        continue
+                    price = sizes[0].get("price") or {}
+                    basic = price.get("basic", 0) / 100
+                    product = price.get("product", 0) / 100
+                    discount_pct = round((1 - product / basic) * 100, 1) if basic else 0
+                    result[sku] = {
+                        "name": p.get("name", ""),
+                        "basic": basic,
+                        "product": product,
+                        "discount_pct": discount_pct,
+                    }
+                break
+
+            except (requests.RequestException, ValueError) as exc:
+                log.warning("Ошибка запроса цен, попытка %d/%d: %s", attempt, config.RETRY_MAX, exc)
+                if attempt < config.RETRY_MAX:
+                    time.sleep(config.RETRY_BACKOFF ** attempt)
+
+        time.sleep(config.RATE_LIMIT_SLEEP)
+
+    log.info("Получены цены для %d/%d SKU", len(result), len(skus))
+    return result
+
+
+def build_price_rows(watchlist: list[dict], prices: dict[int, dict], now: datetime) -> list[list]:
+    date_str = now.strftime("%Y-%m-%d")
+    time_str = now.strftime("%H:%M:%S")
+    rows = []
+    for item in watchlist:
+        info = prices.get(item["sku"])
+        if not info:
+            continue
+        rows.append([
+            date_str,
+            time_str,
+            item["category"],
+            item["sku"],
+            item["brand"],
+            "да" if item["is_ours"] else "нет",
+            info["name"],
+            info["basic"],
+            info["product"],
+            info["discount_pct"],
+        ])
+    return rows
 
 
 # ---------------------------------------------------------------------------
@@ -300,9 +386,20 @@ def main() -> int:
             return 1
 
         log_ws = ensure_log_sheet(spreadsheet)
-        append_rows(log_ws, rows)
+        append_rows(log_ws, rows, config.LOG_SHEET_NAME)
 
-        done_msg = f"✅ Готово {now.strftime('%d.%m %H:%M')} — {len(rows)} строк"
+        session = _get_session()
+        unique_skus = list({item["sku"] for item in watchlist})
+        prices = fetch_prices(session, unique_skus)
+        price_rows = build_price_rows(watchlist, prices, now)
+
+        if price_rows:
+            price_ws = ensure_sheet(spreadsheet, config.PRICE_SHEET_NAME, config.PRICE_HEADERS)
+            append_rows(price_ws, price_rows, config.PRICE_SHEET_NAME)
+        else:
+            log.warning("Не собрано ни одной цены")
+
+        done_msg = f"✅ Готово {now.strftime('%d.%m %H:%M')} — {len(rows)} строк, {len(price_rows)} цен"
         set_status(spreadsheet, done_msg)
         log.info("=== Готово: %d строк записано ===", len(rows))
         return 0
