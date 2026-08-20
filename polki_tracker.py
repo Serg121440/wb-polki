@@ -123,6 +123,77 @@ def read_watchlist(spreadsheet) -> list[dict]:
     return result
 
 
+def _norm_category(name: str) -> str:
+    """Нормализованный ключ категории: без регистра, ё→е, без лишних пробелов."""
+    return " ".join(name.lower().replace("ё", "е").split())
+
+
+def read_vpr(spreadsheet) -> list[dict]:
+    """
+    Читает вкладку «БАЗА ВПР» — кураторскую карту конкурентов
+    (article / Категория / ПП / Сцепить / Арт Дубль / Бренд).
+    Пустые слоты (без артикула) пропускаются.
+    """
+    try:
+        ws = spreadsheet.worksheet(config.VPR_SHEET_NAME)
+    except gspread.WorksheetNotFound:
+        log.warning("Вкладка '%s' не найдена — цены соберём только по '%s'",
+                    config.VPR_SHEET_NAME, config.INPUT_SHEET_NAME)
+        return []
+
+    rows = ws.get_all_values()
+    result = []
+    for row in rows[1:]:
+        if len(row) < 2:
+            continue
+        sku_raw = row[0].strip()
+        if not sku_raw.isdigit():
+            continue
+        brand = row[5].strip() if len(row) > 5 else ""
+        result.append(
+            {
+                "category": row[1].strip(),
+                "sku": int(sku_raw),
+                "brand": brand,
+                "is_ours": brand.strip().lower() == config.OUR_BRAND.lower(),
+            }
+        )
+    log.info("Прочитано %d SKU из '%s'", len(result), config.VPR_SHEET_NAME)
+    return result
+
+
+def read_price_universe(spreadsheet, watchlist: list[dict]) -> list[dict]:
+    """
+    Объединяет «Полки_вход» и «БАЗА ВПР» в единый список для сбора цен.
+    Дедуплицирует по SKU: запись из «Полки_вход» приоритетнее (там выверены
+    названия категорий и флаг «Наш»). Категории из «БАЗА ВПР» приводятся
+    к эталонным названиям через нормализацию и CATEGORY_ALIASES.
+    """
+    canon = {_norm_category(item["category"]): item["category"] for item in watchlist}
+    canon.update(
+        {key: value for key, value in config.CATEGORY_ALIASES.items()}
+    )
+
+    universe: dict[int, dict] = {}
+    for item in watchlist:
+        universe[item["sku"]] = item
+
+    added = 0
+    for item in read_vpr(spreadsheet):
+        item = {**item, "category": canon.get(_norm_category(item["category"]), item["category"])}
+        if item["sku"] in universe:
+            continue
+        universe[item["sku"]] = item
+        added += 1
+
+    log.info(
+        "Универсум цен: %d SKU (%d из '%s' + %d новых из '%s')",
+        len(universe), len(watchlist), config.INPUT_SHEET_NAME,
+        added, config.VPR_SHEET_NAME,
+    )
+    return list(universe.values())
+
+
 def ensure_sheet(spreadsheet, name: str, headers: list[str]):
     """Создаёт вкладку с шапкой, если её нет."""
     try:
@@ -199,62 +270,83 @@ def fetch_recom(session: requests.Session, nm: int, dest: int) -> tuple[list[int
     return [], 0
 
 
+def _fetch_price_batch(session: requests.Session, batch: list[int]) -> dict[int, dict]:
+    """Один запрос карточек. Возвращает {sku: {...}} или {} при ошибке."""
+    params = {**config.WB_CARD_PARAMS, "nm": ";".join(str(s) for s in batch)}
+    result: dict[int, dict] = {}
+
+    for attempt in range(1, config.RETRY_MAX + 1):
+        try:
+            resp = session.get(
+                config.WB_CARD_URL,
+                params=params,
+                timeout=config.REQUEST_TIMEOUT,
+            )
+            if resp.status_code == 429:
+                wait = config.RETRY_BACKOFF ** attempt * 5
+                log.warning("429 при запросе цен, ждём %.0fs", wait)
+                time.sleep(wait)
+                continue
+            resp.raise_for_status()
+
+            data = resp.json()
+            for p in data.get("products", []):
+                sku = p.get("id")
+                sizes = p.get("sizes") or []
+                if not sku or not sizes:
+                    continue
+                price = sizes[0].get("price") or {}
+                basic = price.get("basic", 0) / 100
+                product = price.get("product", 0) / 100
+                discount_pct = round((1 - product / basic) * 100, 1) if basic else 0
+                result[sku] = {
+                    "name": p.get("name", ""),
+                    "basic": basic,
+                    "product": product,
+                    "discount_pct": discount_pct,
+                }
+            return result
+
+        except (requests.RequestException, ValueError) as exc:
+            log.warning("Ошибка запроса цен (%d SKU), попытка %d/%d: %s",
+                        len(batch), attempt, config.RETRY_MAX, exc)
+            if attempt < config.RETRY_MAX:
+                time.sleep(config.RETRY_BACKOFF ** attempt)
+
+    return result
+
+
 def fetch_prices(session: requests.Session, skus: list[int]) -> dict[int, dict]:
     """
     Запрашивает карточки товаров пачками и возвращает цены.
     {sku: {"name": str, "basic": float, "product": float, "discount_pct": float}}
-    Цена берётся из первого размера (sizes[0].price), т.к. для большинства
-    категорий IRON BROTHERS размер один или цена не отличается по размерам.
+
+    Если крупная пачка не отдала ничего (WB режет длинный nm-список или
+    падает на одном битом SKU) — дробим её на части и добираем остаток.
+    Так один нерабочий артикул не обнуляет весь дневной сбор цен.
+    Цена берётся из первого размера (sizes[0].price).
     """
     result: dict[int, dict] = {}
-    batches = [
-        skus[i : i + config.PRICE_BATCH_SIZE]
-        for i in range(0, len(skus), config.PRICE_BATCH_SIZE)
-    ]
 
-    for batch in batches:
-        params = {**config.WB_CARD_PARAMS, "nm": ";".join(str(s) for s in batch)}
+    def crawl(batch: list[int], chunk: int) -> None:
+        for i in range(0, len(batch), chunk):
+            part = batch[i : i + chunk]
+            got = _fetch_price_batch(session, part)
+            result.update(got)
+            time.sleep(config.RATE_LIMIT_SLEEP)
 
-        for attempt in range(1, config.RETRY_MAX + 1):
-            try:
-                resp = session.get(
-                    config.WB_CARD_URL,
-                    params=params,
-                    timeout=config.REQUEST_TIMEOUT,
-                )
-                if resp.status_code == 429:
-                    wait = config.RETRY_BACKOFF ** attempt * 5
-                    log.warning("429 при запросе цен, ждём %.0fs", wait)
-                    time.sleep(wait)
-                    continue
-                resp.raise_for_status()
+            missing = [s for s in part if s not in result]
+            if missing and chunk > 1:
+                next_chunk = 1 if chunk <= 10 else 10
+                log.info("Добираем %d SKU пачками по %d", len(missing), next_chunk)
+                crawl(missing, next_chunk)
 
-                data = resp.json()
-                for p in data.get("products", []):
-                    sku = p.get("id")
-                    sizes = p.get("sizes") or []
-                    if not sku or not sizes:
-                        continue
-                    price = sizes[0].get("price") or {}
-                    basic = price.get("basic", 0) / 100
-                    product = price.get("product", 0) / 100
-                    discount_pct = round((1 - product / basic) * 100, 1) if basic else 0
-                    result[sku] = {
-                        "name": p.get("name", ""),
-                        "basic": basic,
-                        "product": product,
-                        "discount_pct": discount_pct,
-                    }
-                break
-
-            except (requests.RequestException, ValueError) as exc:
-                log.warning("Ошибка запроса цен, попытка %d/%d: %s", attempt, config.RETRY_MAX, exc)
-                if attempt < config.RETRY_MAX:
-                    time.sleep(config.RETRY_BACKOFF ** attempt)
-
-        time.sleep(config.RATE_LIMIT_SLEEP)
+    crawl(skus, config.PRICE_BATCH_SIZE)
 
     log.info("Получены цены для %d/%d SKU", len(result), len(skus))
+    missing = [s for s in skus if s not in result]
+    if missing:
+        log.warning("Без цены остались SKU: %s", ", ".join(str(s) for s in missing[:20]))
     return result
 
 
@@ -348,6 +440,101 @@ def build_rows(watchlist: list[dict], now: datetime) -> list[list]:
 
 
 # ---------------------------------------------------------------------------
+# Сводка цен по категориям
+# ---------------------------------------------------------------------------
+def _arg_sep(spreadsheet) -> str:
+    """Разделитель аргументов формулы зависит от локали таблицы (ru_RU → «;»)."""
+    try:
+        locale = spreadsheet.fetch_sheet_metadata()["properties"].get("locale", "")
+    except Exception:
+        locale = "ru_RU"
+    return "," if locale.startswith("en") else ";"
+
+
+def write_summary(spreadsheet, categories: list[str]) -> None:
+    """
+    Пересобирает вкладку «Цены_сводка»: по строке на категорию, метрики —
+    формулами поверх «Цены_лог», поэтому сводка сама подтягивает свежий срез
+    после каждого запуска парсера (и её видно/можно проверить прямо в таблице).
+
+    Срез определяется парой Дата+Время последнего прогона: за один запуск все
+    строки пишутся с одним временем, так что повторные запуски в один день
+    не задваивают счёт конкурентов.
+    """
+    ws = ensure_sheet(spreadsheet, config.SUMMARY_SHEET_NAME, config.SUMMARY_HEADERS)
+    if ws.col_count < 12:            # K/L — служебные ячейки со срезом
+        ws.resize(cols=12)
+    sep = _arg_sep(spreadsheet)
+
+    def f(template: str) -> str:
+        return template.replace("§", sep)
+
+    log_ref = f"'{config.PRICE_SHEET_NAME}'"
+    # Колонки «Цены_лог»: A Дата, B Время, C Категория, D SKU, F Наш, I Цена_итог
+    date_col, time_col = f"{log_ref}!$A$2:$A", f"{log_ref}!$B$2:$B"
+    cat_col, sku_col = f"{log_ref}!$C$2:$C", f"{log_ref}!$D$2:$D"
+    own_col, price_col = f"{log_ref}!$F$2:$F", f"{log_ref}!$I$2:$I"
+
+    # Нулевая цена = карточки нет в наличии, в статистику её не берём
+    def flt(row: int, own: str) -> str:
+        return (
+            f"FILTER({price_col}§{cat_col}=$A{row}§{own_col}=\"{own}\""
+            f"§{date_col}=$L$1§{time_col}=$L$2§{price_col}>0)"
+        )
+
+    def counts(row: int, extra: str = "") -> str:
+        return (
+            f"=COUNTIFS({cat_col}§$A{row}§{date_col}§$L$1§{time_col}§$L$2{extra})"
+        )
+
+    rows = []
+    for idx, category in enumerate(categories, start=2):
+        rows.append([
+            category,
+            f(f"=IFERROR(TEXTJOIN(\", \"§TRUE§UNIQUE(FILTER({sku_col}§{cat_col}=$A{idx}"
+              f"§{own_col}=\"да\"§{date_col}=$L$1§{time_col}=$L$2)))§\"\")"),
+            f(f"=IFERROR(MEDIAN({flt(idx, 'да')})§\"\")"),
+            f(counts(idx, f"§{own_col}§\"нет\"§{price_col}§\">0\"")),
+            f(f"=IFERROR(MIN({flt(idx, 'нет')})§\"\")"),
+            f(f"=IFERROR(MEDIAN({flt(idx, 'нет')})§\"\")"),
+            f(f"=IFERROR(MAX({flt(idx, 'нет')})§\"\")"),
+            f(f"=IF(N($C{idx})=0§\"\"§IFERROR(ROUND(($C{idx}/$F{idx}-1)*100§1)§\"\"))"),
+            f(f"=IF(N($C{idx})=0§\"\"§{counts(idx, f'§{price_col}§\"<\"&$C{idx}§{price_col}§\">0\"')[1:]}+1)"),
+            f(counts(idx, f"§{price_col}§0")),
+        ])
+
+    ws.update(values=[config.SUMMARY_HEADERS], range_name="A1:J1", value_input_option="RAW")
+    ws.update(
+        values=rows,
+        range_name=f"A2:J{len(rows) + 1}",
+        value_input_option="USER_ENTERED",
+    )
+
+    # Срез, на который считается сводка (последний прогон парсера)
+    ws.update(
+        values=[
+            ["Срез — дата:", f(f"=IFERROR(INDEX(SORT(UNIQUE(FILTER({date_col}§{date_col}<>\"\"))§1§FALSE)§1)§\"\")")],
+            ["Срез — время:", f(f"=IFERROR(INDEX(SORT(UNIQUE(FILTER({time_col}§{date_col}=$L$1))§1§FALSE)§1)§\"\")")],
+        ],
+        range_name="K1:L2",
+        value_input_option="USER_ENTERED",
+    )
+
+    # Чистим хвост от категорий, которых больше нет
+    tail_start = len(rows) + 2
+    if ws.row_count >= tail_start:
+        ws.batch_clear([f"A{tail_start}:J{ws.row_count}"])
+
+    try:
+        ws.freeze(rows=1)
+        ws.format("A1:J1", {"textFormat": {"bold": True}})
+    except Exception as exc:
+        log.warning("Не удалось оформить '%s': %s", config.SUMMARY_SHEET_NAME, exc)
+
+    log.info("Сводка '%s' пересобрана: %d категорий", config.SUMMARY_SHEET_NAME, len(rows))
+
+
+# ---------------------------------------------------------------------------
 # Точка входа
 # ---------------------------------------------------------------------------
 def set_status(spreadsheet, status: str):
@@ -359,9 +546,46 @@ def set_status(spreadsheet, status: str):
         log.warning("Не удалось обновить статус: %s", e)
 
 
-def main() -> int:
+def collect_prices(spreadsheet, watchlist: list[dict], now: datetime) -> int:
+    """
+    Собирает цены по всем конкурентам («Полки_вход» + «БАЗА ВПР»),
+    дописывает их в «Цены_лог» и пересобирает сводку по категориям.
+    Возвращает число записанных строк.
+    """
+    universe = read_price_universe(spreadsheet, watchlist)
+    session = _get_session()
+    unique_skus = list({item["sku"] for item in universe})
+    prices = fetch_prices(session, unique_skus)
+    price_rows = build_price_rows(universe, prices, now)
+
+    if not price_rows:
+        log.warning("Не собрано ни одной цены")
+        send_telegram("⚠️ <b>wb_polki</b>: цены не собраны — WB не отдал ни одной карточки")
+        return 0
+
+    price_ws = ensure_sheet(spreadsheet, config.PRICE_SHEET_NAME, config.PRICE_HEADERS)
+    append_rows(price_ws, price_rows, config.PRICE_SHEET_NAME)
+
+    coverage = len(prices) / len(unique_skus) if unique_skus else 0
+    if coverage < config.PRICE_COVERAGE_ALERT:
+        send_telegram(
+            f"⚠️ <b>wb_polki</b>: цены получены только для "
+            f"{len(prices)} из {len(unique_skus)} SKU ({coverage:.0%})"
+        )
+
+    # Порядок категорий: как в «Полки_вход», затем новые из «БАЗА ВПР»
+    categories: list[str] = []
+    for item in universe:
+        if item["category"] and item["category"] not in categories:
+            categories.append(item["category"])
+    write_summary(spreadsheet, categories)
+
+    return len(price_rows)
+
+
+def main(prices_only: bool = False) -> int:
     now = datetime.now(MSK)
-    log.info("=== wb_polki_tracker запуск %s ===", now.isoformat())
+    log.info("=== wb_polki_tracker запуск %s (prices_only=%s) ===", now.isoformat(), prices_only)
 
     try:
         spreadsheet = get_gsheet()
@@ -376,32 +600,26 @@ def main() -> int:
             send_telegram(f"⚠️ <b>wb_polki</b>: {msg}")
             return 1
 
-        rows = build_rows(watchlist, now)
+        rows = []
+        if not prices_only:
+            rows = build_rows(watchlist, now)
 
-        if not rows:
-            msg = "Не собрано ни одной строки — проверьте доступность WB API и watchlist."
-            log.error(msg)
-            set_status(spreadsheet, "❌ Нет данных от WB")
-            send_telegram(f"⚠️ <b>wb_polki</b>: {msg}")
-            return 1
+            if not rows:
+                msg = "Не собрано ни одной строки — проверьте доступность WB API и watchlist."
+                log.error(msg)
+                set_status(spreadsheet, "❌ Нет данных от WB")
+                send_telegram(f"⚠️ <b>wb_polki</b>: {msg}")
+                return 1
 
-        log_ws = ensure_log_sheet(spreadsheet)
-        append_rows(log_ws, rows, config.LOG_SHEET_NAME)
+            log_ws = ensure_log_sheet(spreadsheet)
+            append_rows(log_ws, rows, config.LOG_SHEET_NAME)
 
-        session = _get_session()
-        unique_skus = list({item["sku"] for item in watchlist})
-        prices = fetch_prices(session, unique_skus)
-        price_rows = build_price_rows(watchlist, prices, now)
+        # Цены собираем всегда — даже если полки не отработали
+        price_count = collect_prices(spreadsheet, watchlist, now)
 
-        if price_rows:
-            price_ws = ensure_sheet(spreadsheet, config.PRICE_SHEET_NAME, config.PRICE_HEADERS)
-            append_rows(price_ws, price_rows, config.PRICE_SHEET_NAME)
-        else:
-            log.warning("Не собрано ни одной цены")
-
-        done_msg = f"✅ Готово {now.strftime('%d.%m %H:%M')} — {len(rows)} строк, {len(price_rows)} цен"
+        done_msg = f"✅ Готово {now.strftime('%d.%m %H:%M')} — {len(rows)} строк, {price_count} цен"
         set_status(spreadsheet, done_msg)
-        log.info("=== Готово: %d строк записано ===", len(rows))
+        log.info("=== Готово: %d строк полок, %d строк цен ===", len(rows), price_count)
         return 0
 
     except Exception as exc:
@@ -418,4 +636,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # --prices-only — пересобрать только цены и сводку, без обхода полок
+    sys.exit(main(prices_only="--prices-only" in sys.argv))
