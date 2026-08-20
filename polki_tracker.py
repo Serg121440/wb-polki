@@ -210,10 +210,24 @@ def ensure_log_sheet(spreadsheet):
 
 
 def append_rows(ws, rows: list[list], sheet_name: str = "") -> None:
+    """
+    Дописывает строки строго под последнюю заполненную.
+
+    Намеренно не используем ws.append_rows(): там Sheets сам определяет границу
+    «таблицы» и в режиме OVERWRITE молча затирает строки ниже неё — так прогон
+    20.08 23:52 съел хвост предыдущего (112 записанных → 91 в листе).
+    """
     if not rows:
         return
-    ws.append_rows(rows, value_input_option="RAW")
-    log.info("Дописано %d строк в '%s'", len(rows), sheet_name or ws.title)
+
+    first_free = len(ws.col_values(1)) + 1
+    last_needed = first_free + len(rows) - 1
+    if last_needed > ws.row_count:
+        ws.add_rows(last_needed - ws.row_count + 1000)
+
+    ws.update(values=rows, range_name=f"A{first_free}", value_input_option="RAW")
+    log.info("Дописано %d строк в '%s' (со строки %d)",
+             len(rows), sheet_name or ws.title, first_free)
 
 
 # ---------------------------------------------------------------------------
