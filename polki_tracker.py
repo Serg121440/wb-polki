@@ -271,7 +271,7 @@ def fetch_recom(session: requests.Session, nm: int, dest: int) -> tuple[list[int
 
 
 def _fetch_price_batch(session: requests.Session, batch: list[int]) -> dict[int, dict]:
-    """Один запрос карточек. Возвращает {sku: {...}} или {} при ошибке."""
+    """Один запрос карточек. Возвращает {sku: {"name", "product"}} или {} при ошибке."""
     params = {**config.WB_CARD_PARAMS, "nm": ";".join(str(s) for s in batch)}
     result: dict[int, dict] = {}
 
@@ -296,14 +296,9 @@ def _fetch_price_batch(session: requests.Session, batch: list[int]) -> dict[int,
                 if not sku or not sizes:
                     continue
                 price = sizes[0].get("price") or {}
-                basic = price.get("basic", 0) / 100
-                product = price.get("product", 0) / 100
-                discount_pct = round((1 - product / basic) * 100, 1) if basic else 0
                 result[sku] = {
                     "name": p.get("name", ""),
-                    "basic": basic,
-                    "product": product,
-                    "discount_pct": discount_pct,
+                    "product": price.get("product", 0) / 100,
                 }
             return result
 
@@ -319,7 +314,7 @@ def _fetch_price_batch(session: requests.Session, batch: list[int]) -> dict[int,
 def fetch_prices(session: requests.Session, skus: list[int]) -> dict[int, dict]:
     """
     Запрашивает карточки товаров пачками и возвращает цены.
-    {sku: {"name": str, "basic": float, "product": float, "discount_pct": float}}
+    {sku: {"name": str, "product": float}}
 
     Если крупная пачка не отдала ничего (WB режет длинный nm-список или
     падает на одном битом SKU) — дробим её на части и добираем остаток.
@@ -366,9 +361,7 @@ def build_price_rows(watchlist: list[dict], prices: dict[int, dict], now: dateti
             item["brand"],
             "да" if item["is_ours"] else "нет",
             info["name"],
-            info["basic"],
             info["product"],
-            info["discount_pct"],
         ])
     return rows
 
@@ -470,10 +463,10 @@ def write_summary(spreadsheet, categories: list[str]) -> None:
         return template.replace("§", sep)
 
     log_ref = f"'{config.PRICE_SHEET_NAME}'"
-    # Колонки «Цены_лог»: A Дата, B Время, C Категория, D SKU, F Наш, I Цена_итог
+    # Колонки «Цены_лог»: A Дата, B Время, C Категория, D SKU, F Наш, H Цена_итог
     date_col, time_col = f"{log_ref}!$A$2:$A", f"{log_ref}!$B$2:$B"
     cat_col, sku_col = f"{log_ref}!$C$2:$C", f"{log_ref}!$D$2:$D"
-    own_col, price_col = f"{log_ref}!$F$2:$F", f"{log_ref}!$I$2:$I"
+    own_col, price_col = f"{log_ref}!$F$2:$F", f"{log_ref}!$H$2:$H"
 
     # Нулевая цена = карточки нет в наличии, в статистику её не берём
     def flt(row: int, own: str) -> str:
